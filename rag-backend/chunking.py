@@ -19,5 +19,6 @@ def chunk_transcript(transcript, window_sec=WINDOW_SEC, overlap_sec=OVERLAP_SEC)
             current_start = current[0]['start'] if current else seg['start']
         current.append(seg)
     if current:
-        chunks.append({"text": " ".join(s['text'] for s in current), "start": current_start, "end": transcript[-1]['start']})
+        last_end = transcript[-1]['start'] + transcript[-1].get('duration', 0.0)
+        chunks.append({"text": " ".join(s['text'] for s in current), "start": current_start, "end": last_end})
     return chunks
