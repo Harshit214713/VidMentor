@@ -1,5 +1,5 @@
 import os
-import pickle
+import json
 import faiss
 from config import CACHE_DIR, EMBEDDING_MODEL, WINDOW_SEC, OVERLAP_SEC
 
@@ -19,14 +19,23 @@ def get_cache_key(video_id: str, model_name: str | None = None) -> str:
 def save_to_disk(video_id, chunks, index, model_name=None):
     key = get_cache_key(video_id, model_name)
     faiss.write_index(index, f"{CACHE_DIR}/{key}.index")
-    with open(f"{CACHE_DIR}/{key}_chunks.pkl", "wb") as f:
-        pickle.dump(chunks, f)
+    with open(f"{CACHE_DIR}/{key}_chunks.json", "w", encoding="utf-8") as f:
+        json.dump(chunks, f, ensure_ascii=False)
 
 def load_from_disk(video_id, model_name=None):
     key = get_cache_key(video_id, model_name)
-    idx_path, chunks_path = f"{CACHE_DIR}/{key}.index", f"{CACHE_DIR}/{key}_chunks.pkl"
+    idx_path = f"{CACHE_DIR}/{key}.index"
+    chunks_path = f"{CACHE_DIR}/{key}_chunks.json"
     if os.path.exists(idx_path) and os.path.exists(chunks_path):
-        with open(chunks_path, "rb") as f:
-            chunks = pickle.load(f)
-        return chunks, faiss.read_index(idx_path)
+        try:
+            with open(chunks_path, "r", encoding="utf-8") as f:
+                chunks = json.load(f)
+            if not isinstance(chunks, list):
+                return None
+            for chunk in chunks:
+                if not isinstance(chunk, dict) or "text" not in chunk or "start" not in chunk:
+                    return None
+            return chunks, faiss.read_index(idx_path)
+        except (json.JSONDecodeError, ValueError, OSError):
+            return None
     return None
