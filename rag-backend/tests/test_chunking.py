@@ -38,6 +38,13 @@ def test_chunk_start_is_not_after_end():
 def test_empty_transcript_returns_no_chunks():
     assert chunk_transcript([]) == []
 
+
+def test_single_segment_has_positive_duration_matching_duration():
+    chunks = chunk_transcript([seg("hello", 10.0)], window_sec=40)
+    assert len(chunks) == 1
+    assert chunks[0]["start"] == 10.0
+    assert chunks[0]["end"] == 12.0
+
 def test_zero_overlap_matches_no_overlap():
     t = [seg(str(i), i * 7) for i in range(50)]
     assert chunk_transcript(t, window_sec=40, overlap_sec=0) == chunk_transcript(t, window_sec=40)
