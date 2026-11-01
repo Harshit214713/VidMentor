@@ -1,5 +1,5 @@
 import os
-import pickle
+import json
 import faiss
 import logging
 from config import CACHE_DIR, EMBEDDING_MODEL, WINDOW_SEC, OVERLAP_SEC
@@ -22,16 +22,22 @@ def get_cache_key(video_id: str, model_name: str | None = None) -> str:
 def save_to_disk(video_id, chunks, index, model_name=None):
     key = get_cache_key(video_id, model_name)
     faiss.write_index(index, f"{CACHE_DIR}/{key}.index")
-    with open(f"{CACHE_DIR}/{key}_chunks.pkl", "wb") as f:
-        pickle.dump(chunks, f)
+    with open(f"{CACHE_DIR}/{key}_chunks.json", "w", encoding="utf-8") as f:
+        json.dump(chunks, f, ensure_ascii=False)
 
 def load_from_disk(video_id, model_name=None):
     key = get_cache_key(video_id, model_name)
-    idx_path, chunks_path = f"{CACHE_DIR}/{key}.index", f"{CACHE_DIR}/{key}_chunks.pkl"
+    idx_path = f"{CACHE_DIR}/{key}.index"
+    chunks_path = f"{CACHE_DIR}/{key}_chunks.json"
     if os.path.exists(idx_path) and os.path.exists(chunks_path):
         try:
-            with open(chunks_path, "rb") as f:
-                chunks = pickle.load(f)
+            with open(chunks_path, "r", encoding="utf-8") as f:
+                chunks = json.load(f)
+            if not isinstance(chunks, list):
+                raise ValueError("Chunks must be a list")
+            for chunk in chunks:
+                if not isinstance(chunk, dict) or "text" not in chunk or "start" not in chunk:
+                    raise ValueError("Malformed chunk structure")
             return chunks, faiss.read_index(idx_path)
         except Exception as e:
             logger.warning("Corrupt disk cache for %s (%s); purging", video_id, e)
@@ -41,4 +47,5 @@ def load_from_disk(video_id, model_name=None):
                         os.remove(path)
                 except OSError:
                     pass
+            return None
     return None

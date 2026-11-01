@@ -11,18 +11,22 @@ Stuck on a concept mid-video? Open the chat, ask your doubt, and get an answer s
 ```
 YouTube video page
    └── content script (chat widget, reads video_id + current playback time)
+         │  chrome.runtime.sendMessage
+         ▼
+   service worker (background.js: backend URL, one session_id per browser profile)
          │  fetch()
          ▼
 FastAPI backend
-   ├── /index → fetches transcript, chunks it (40s windows, timestamped),
+   ├── /index → fetches transcript, chunks it (40s overlapping windows, timestamped),
    │            embeds chunks, builds a FAISS index, caches it (memory + disk)
-   └── /chat  → embeds the question, retrieves top-k relevant chunks
+   └── /chat  → rewrites a follow-up question into a standalone one (used for the search only),
+                embeds it, retrieves top-k relevant chunks
                 (biased toward the current playback timestamp),
-                sends them + the question to an LLM (Groq),
+                sends them + the question + the session's chat history to an LLM (Groq),
                 returns a grounded answer
 ```
 
-**Pipeline:** `video_id → transcript → timestamped chunks → embeddings → FAISS index → [query + current_time] → retrieval (time-biased) → LLM answer`
+**Pipeline:** `video_id → transcript → timestamped overlapping chunks → embeddings → FAISS index → [query (rewritten if it is a follow-up) + current_time] → retrieval (time-biased) → LLM answer`
 
 ---
 
@@ -38,7 +42,7 @@ FastAPI backend
 | Extension | Chrome Manifest V3 (content script + service worker) |
 | Tests | pytest |
 
-**Chunking strategy:** fixed time-window chunking. Transcript segments are grouped into ~40-second windows (non-overlapping), each tagged with its start/end timestamp. This keeps chunks meaningful (a "complete thought") and lets retrieval be biased toward what's currently playing.
+**Chunking strategy:** fixed time-window chunking with overlap. Transcript segments are grouped into 40-second windows, and neighbouring windows overlap (`WINDOW_SEC` and `OVERLAP_SEC` in `config.py`), so a thought that crosses a chunk boundary is not lost. Each chunk is tagged with its start/end timestamp. This keeps chunks meaningful (a "complete thought") and lets retrieval be biased toward what's currently playing.
 
 **Retrieval:** semantic similarity search via FAISS, re-ranked with a soft penalty for chunks far from the viewer's current timestamp, so answers stay relevant to where the user actually is in the video, not just wherever similar words appear.
 
@@ -48,11 +52,15 @@ FastAPI backend
 
 - Answers grounded only in the video's transcript (no hallucinated general knowledge)
 - Timestamp-aware retrieval that prioritizes context near your current playback position
-- Multi-turn conversation: follow-up questions ("what's *its* time complexity?") resolve correctly using chat history
+- Multi-turn conversation: follow-up questions ("what's *its* time complexity?") are rewritten into standalone questions for the transcript search, while the prompt and history keep your original wording
+- Chat history is kept per session and video (one session id per browser profile), with a cap on messages per session and an LRU limit on stored sessions
 - Clickable timestamps in answers that jump the video to that exact moment
-- Per-video caching (memory + disk), so repeat visits don't re-index
-- Handles disabled/missing captions, invalid video IDs, empty transcripts, and API rate limits
+- Per-video caching (memory + disk): the FAISS index plus the chunks stored as JSON. Cache keys include the embedding model and chunk settings, so changing them rebuilds the index
+- The video is pre-indexed when you open the chat panel, and the widget also works when you open a video from the YouTube home page
+- Dark mode for the chat widget
+- Friendly error messages for disabled/missing captions, invalid video IDs, empty transcripts, and API rate limits or timeouts
 - Multi-language transcript fallback (tries English/Hindi first, falls back to whatever is available)
+- Optional multilingual embeddings for Hindi transcripts (see [Setup](#setup))
 
 ---
 
@@ -64,25 +72,26 @@ VidMentor/
 │   ├── main.py              # FastAPI app and routes only
 │   ├── config.py            # constants: models, window size, top-k, cache dir
 │   ├── transcript.py        # fetch transcripts, language fallback
-│   ├── chunking.py          # time-window chunking
+│   ├── chunking.py          # time-window chunking (with overlap)
 │   ├── embeddings.py        # shared embedding model
 │   ├── indexer.py           # build/load FAISS index per video
-│   ├── cache.py             # memory + disk cache
+│   ├── cache.py             # memory + disk cache (FAISS index + chunks as JSON)
 │   ├── retrieval.py         # similarity search + time penalty
+│   ├── query_rewrite.py     # follow-up question -> standalone question (search only)
 │   ├── prompts.py           # prompt building
-│   ├── llm.py               # Groq client + retry
+│   ├── llm.py               # Groq client + retry + timeouts
 │   ├── schemas.py           # request models
 │   ├── tests/               # pytest tests
 │   ├── requirements.txt
 │   ├── requirements-dev.txt # pytest (dev only)
-│   ├── .env.example         # template for your API key
+│   ├── .env.example         # template for your API key and optional settings
 │   └── rag_cache/           # auto-created, cached indexes (gitignored)
 │
 └── yt-doubt-extension/
     ├── manifest.json        # Manifest V3 config
-    ├── background.js        # service worker, calls the backend
+    ├── background.js        # service worker, calls the backend, keeps the session id
     ├── content.js           # injects chat widget on YouTube pages
-    ├── content.css          # widget styling
+    ├── content.css          # widget styling (light and dark)
     └── icons/
         └── icon128.png
 ```
@@ -114,14 +123,26 @@ GROQ_API_KEY=your_groq_api_key_here
 GROQ_TIMEOUT_SEC=30.0
 
 # Optional overrides:
-# MAX_HISTORY_MESSAGES=20   # per-video chat history cap (even numbers only; defaults to 20)
+# EMBEDDING_MODEL=paraphrase-multilingual-MiniLM-L12-v2   # for Hindi transcripts
+# MAX_HISTORY_MESSAGES=20   # chat history cap per session (even numbers only; defaults to 20)
 # MAX_CHAT_SESSIONS=100     # LRU store cap for concurrent sessions (defaults to 100)
+# REWRITE_ENABLED=1         # 0 turns off the follow-up question rewrite
+# REWRITE_TIMEOUT_SEC=8.0   # timeout for the rewrite call (defaults to 8.0)
 ```
 
 (Free key from [console.groq.com](https://console.groq.com/keys))
 
-`GROQ_TIMEOUT_SEC` configures the per-request Groq API timeout (in seconds) and defaults to `30.0`.
-`MAX_HISTORY_MESSAGES` caps how many messages of chat history are kept per video session (rounded down to the nearest even number so whole exchanges stay intact; default `20`), and `MAX_CHAT_SESSIONS` caps how many video sessions are held in memory at once — the least recently used session is evicted when the store is full (default `100`).
+| Setting | What it does |
+|---|---|
+| `GROQ_API_KEY` | Your Groq key (required) |
+| `GROQ_TIMEOUT_SEC` | Per-request Groq API timeout in seconds (default `30.0`) |
+| `EMBEDDING_MODEL` | Embedding model (default `all-MiniLM-L6-v2`) |
+| `MAX_HISTORY_MESSAGES` | Messages of chat history kept per session and video, rounded down to the nearest even number so whole exchanges stay intact (default `20`) |
+| `MAX_CHAT_SESSIONS` | Sessions held in memory at once; the least recently used one is evicted when the store is full (default `100`) |
+| `REWRITE_ENABLED` | `0` turns the follow-up question rewrite off (default on) |
+| `REWRITE_TIMEOUT_SEC` | Timeout for the rewrite call (default `8.0`) |
+
+**Follow-up question rewrite:** follow-up questions are rewritten into a standalone question before the transcript search (so "what's its time complexity?" finds the right part of the video). The rewrite is skipped when the chat has no history; with history it runs for short questions (under 8 words) or ones with a reference word like "it", "that" or "iska". Only the search uses the rewritten text; the prompt and history keep your original question, and on any error the original is used. The rewrite is one extra Groq call per follow-up.
 
 Run it:
 
@@ -141,7 +162,11 @@ Interactive API docs: `http://localhost:8000/docs`
 
 Go to any YouTube video and look for the **"❓ Ask Doubt"** button in the bottom-right corner.
 
+> **Already have YouTube tabs open?** After installing or reloading the extension, refresh them, otherwise the widget will not appear there.
+
 > **Local development:** set `BACKEND_URL` in `yt-doubt-extension/background.js` to `http://localhost:8000`. `manifest.json` already allows both localhost and the deployed backend in `host_permissions`. Please do not commit the localhost URL.
+
+The extension asks for the `storage` permission only, to remember one random session id per browser profile.
 
 ### Running tests
 
@@ -151,7 +176,7 @@ pip install -r requirements-dev.txt
 python -m pytest
 ```
 
-The tests cover chunking, retrieval ranking (including the timestamp penalty), prompt building, and empty-transcript handling. They run in under a second and need no API key or model download.
+The tests cover chunking, retrieval ranking (including the timestamp penalty), prompt building, the disk cache, chat sessions and history limits, query rewriting, and empty-transcript handling. They run in a few seconds and need no API key, network or model download.
 
 ---
 
@@ -168,13 +193,17 @@ Pre-builds the index for a video (optional, `/chat` builds it automatically on f
 {
   "video_id": "VIDEO_ID",
   "query": "why did he use a hashmap instead of an array?",
-  "current_time": 245
+  "current_time": 245,
+  "session_id": "optional, up to 64 characters"
 }
 ```
+`session_id` is optional. The extension sends one id per browser profile; if it is missing, history falls back to one shared history per video.
+
 Response:
 ```json
 { "success": true, "answer": "..." }
 ```
+If the AI service times out, is rate limited or fails upstream, the API returns an HTTP error status with `"success": false`, and the failed exchange is not saved to the chat history.
 
 ### `GET /health`
 Basic liveness check.
@@ -193,15 +222,15 @@ Deployed on [Render](https://render.com) (free tier):
 ## Known limitations
 
 - **Transcript fetching can fail on cloud hosts.** YouTube blocks many cloud IPs (including Render's free tier), so the deployed backend may return "could not retrieve a transcript". It works from a normal home connection when you run the backend locally. A client-side transcript fetch would avoid this and is a good contribution.
-- **Embedding model:** By default, `all-MiniLM-L6-v2` is used for lightweight memory footprint (~200MB, well within the 512MB free-tier RAM limit). For Hindi transcripts, `EMBEDDING_MODEL=paraphrase-multilingual-MiniLM-L12-v2` can be opted into via `.env` (note: sits at ~445MB RAM; Roman-script Hinglish was not tested).
+- **Embedding model and memory:** the default `all-MiniLM-L6-v2` is the lightweight option. For Hindi transcripts, `EMBEDDING_MODEL=paraphrase-multilingual-MiniLM-L12-v2` can be opted into via `.env`; it uses noticeably more RAM (about 445 MB for the Python process in one measurement on Windows), which is tight on Render's 512 MB free tier. Roman-script Hinglish was not tested.
 - **Chat history is kept per session and video**, where a session is one id per browser profile (stored in `chrome.storage.local`), and it resets on restart.
+- **Old `.pkl` caches** from before the JSON change are ignored and rebuilt. They are not deleted.
 - **Free-tier hosting:** the server spins down after ~15 minutes of inactivity (first request after idle takes ~30-50s), and the disk is ephemeral, so cached indexes reset on redeploy/restart.
 
 ---
 
 ## Roadmap
 
-- Overlapping chunk windows (reduce context loss at chunk boundaries)
 - Multilingual model optimization for low-memory cloud hosts
 - Client-side transcript fetching (avoids YouTube IP blocking)
 - Move cache storage to Redis or a persistent volume
@@ -214,7 +243,7 @@ See the [open issues](../../issues) for tasks you can pick up.
 
 ## Contributing
 
-Contributions are welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) first. It covers setup, how to pick an issue, and what a good pull request looks like. Issues are labeled `good first issue`, `intermediate`, and `advanced`.
+Contributions are welcome! Please read [CONTRIBUTING.md](CONTRIBUTING.md) first. It covers setup, how to pick an issue, and what a good pull request looks like. Issues are labeled `level 1`, `level 2` and `level 3`.
 
 ---
 
